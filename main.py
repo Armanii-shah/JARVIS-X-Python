@@ -45,7 +45,7 @@ def test_groq():
 @app.post("/analyze")
 def analyze_email(email: EmailRequest):
     try:
-        prompt = f"""You are an email security expert. Analyze this email and return ONLY a JSON object with no markdown, no backticks, no explanation.
+        prompt = f"""You are a strict email security expert. Analyze this email carefully.
 
 Email:
 Subject: {email.subject}
@@ -54,13 +54,17 @@ Body: {email.body}
 Links: {email.links}
 Attachments: {email.attachments}
 
-Return exactly this format:
-{{"score": 85, "threatLevel": "HIGH", "reason": "one sentence"}}
+Scoring rules:
+- Legitimate emails from known services (Google, LinkedIn, etc): score 10-30
+- Newsletter or promotional emails: score 20-40
+- Suspicious emails with urgency tactics: score 50-70
+- Phishing emails with fake links or malware: score 80-95
+- Emails with dangerous attachments (.exe, .bat): score 90-100
 
-Rules:
-- score 0-40 = LOW
-- score 41-60 = MEDIUM
-- score 61-100 = HIGH"""
+Return ONLY this JSON, no markdown:
+{{"score": 25, "threatLevel": "LOW", "reason": "Brief specific reason about this email"}}
+
+threatLevel must be: LOW for 0-40, MEDIUM for 41-60, HIGH for 61-100"""
 
         response = client.chat.completions.create(
             model="llama-3.1-8b-instant",
