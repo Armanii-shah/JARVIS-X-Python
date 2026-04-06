@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import unicodedata
 import uvicorn
 from dotenv import load_dotenv
 load_dotenv()
@@ -82,6 +83,15 @@ def analyze_email(email: EmailRequest):
     subject = email.subject.strip() or "(No Subject)"
     sender = email.sender.strip() or "(Unknown Sender)"
     body_preview = email.body[:500].strip()
+
+    # Remove non-ASCII characters that can break JSON parsing
+    body_preview = body_preview.encode('ascii', 'ignore').decode('ascii')
+    subject = subject.encode('ascii', 'ignore').decode('ascii')
+    sender = sender.encode('ascii', 'ignore').decode('ascii')
+
+    # Remove extra whitespace
+    body_preview = ' '.join(body_preview.split())
+
     links = email.links[:20]       # cap to prevent oversized prompts
     attachments = email.attachments[:20]
 
