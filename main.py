@@ -104,19 +104,19 @@ Body preview: {body_preview}
 Links: {links}
 Attachments: {attachments}
 
-SCORING BANDS — pick the MOST specific one:
+SCORING BANDS — pick the MOST specific one that applies:
 
-0-10: Completely safe. Legitimate sender domain, no links, personal/professional content.
-Examples: GitHub notifications, Google/Microsoft official emails, personal emails from contacts.
+0-10: Completely safe. Legitimate known sender domain, no links, personal/professional content.
+Examples: GitHub notifications, Google/Microsoft official emails, personal emails from known contacts.
 
 11-25: Low risk. Known brand newsletter, tracking links only, no urgency, real domain.
 Examples: MongoDB newsletter, LinkedIn job alert, Notion updates, YouTube recommendations.
 
-26-45: Slightly suspicious. Unknown sender but no malicious content, mild promotional language.
-Examples: Cold outreach email, unknown newsletter, generic promotional email.
+26-40: Slightly suspicious. Unknown sender (personal gmail/yahoo/hotmail/unknown company) with NO malicious content, NO links, NO attachments, NO urgency. Harmless but unrecognized.
+Examples: Test email from unknown personal Gmail, cold intro email with no links, generic "hello" from unknown sender.
 
-46-60: Moderate risk. Urgency language OR suspicious link OR slightly fake domain. Only ONE red flag.
-Examples: "Your account needs attention" with real domain, mildly suspicious link, vague threat.
+41-60: Moderate risk. Requires at least ONE concrete red flag: urgency language OR suspicious link OR slightly fake domain.
+Examples: "Your account needs attention" with real domain, mildly suspicious link, vague threat language.
 
 61-75: High risk. Multiple red flags: urgency + suspicious domain, OR fake domain mimicking real brand.
 Examples: "netfl1x-billing.xyz", "paypa1-secure.com", urgency + suspicious link.
@@ -129,23 +129,23 @@ Examples: FIA arrest notice + 10 malware files + bitcoin payment demand.
 
 CRITICAL RULES:
 - Legitimate known services (Google, GitHub, LinkedIn, MongoDB, Notion) = ALWAYS 0-25
-- Same threat level emails must get DIFFERENT scores (vary by ±5-10 points based on specifics)
-- Count red flags: each one adds 10-15 points
-- Real company domain = automatically below 30
+- Personal email domains (gmail.com, yahoo.com, hotmail.com, outlook.com) with benign content, NO links, NO attachments, NO urgency = ALWAYS 15-35 (LOW)
+- A score of 41+ (MEDIUM) REQUIRES at least ONE concrete red flag. Zero red flags = score below 41
+- Count red flags: each one adds 10-15 points above 40
+- Real company domain = automatically below 40
 - Fake domain (.xyz, .ml, .tk mimicking real brand) = minimum 61
 - Each dangerous attachment (.exe, .bat, .cmd, .vbs, .ps1, .jar, .msi) = +8 points
 - Ransom/arrest/government impersonation = +20 points minimum
 - Multiple attack vectors = 89-100 ONLY
 
 Return ONLY valid JSON:
-{{"score": 45, "threatLevel": "MEDIUM", "reason": "Specific reason with exact threat indicators found"}}
+{{"score": 30, "threatLevel": "LOW", "reason": "Specific reason with exact threat indicators found"}}
 
 threatLevel mapping:
 - 0-40 = "LOW"
 - 41-60 = "MEDIUM"
 - 61-100 = "HIGH"
-
-Never give the same score to two different emails unless they are identical threats."""
+"""
 
     try:
         response = client.chat.completions.create(
