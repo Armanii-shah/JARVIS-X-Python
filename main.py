@@ -49,6 +49,79 @@ def map_threat_level(score: int) -> str:
     return "HIGH"
 
 
+DANGEROUS_EXTENSIONS = {'.exe', '.bat', '.cmd', '.vbs', '.ps1', '.jar', '.msi', '.scr', '.pif'}
+SUSPICIOUS_TLDS = {'.xyz', '.ml', '.tk', '.pw', '.cf', '.ga', '.gq', '.icu', '.top', '.click', '.download'}
+URGENCY_PHRASES = [
+    'expires in', 'act now', 'within 24 hours', 'offer expires', '24 hours',
+    'immediate action', 'verify now', 'account will be suspended', 'arrested',
+    'legal action', 'start monday', 'no interview', 'pre-selected', 'pre selected',
+]
+
+
+def rule_based_floor(subject: str, sender: str, body: str, links: list, attachments: list) -> int:
+    """
+    Returns a minimum floor score based on deterministic red-flag counting.
+    The LLM score is then clamped to max(llm_score, floor).
+    """
+    combined_text = f"{subject} {sender} {body}".lower()
+
+    # Count dangerous file extensions — check real attachments AND body text
+    dangerous_ext_count = 0
+    for att in attachments:
+        ext = '.' + att.rsplit('.', 1)[-1].lower() if '.' in att else ''
+        if ext in DANGEROUS_EXTENSIONS:
+            dangerous_ext_count += 1
+    for ext in DANGEROUS_EXTENSIONS:
+        if ext in combined_text:
+            dangerous_ext_count += combined_text.count(ext)
+
+    # Check suspicious TLDs in links
+    suspicious_link_count = 0
+    for link in links:
+        for tld in SUSPICIOUS_TLDS:
+            if tld in link.lower():
+                suspicious_link_count += 1
+                break
+
+    # Check urgency language
+    urgency_count = sum(1 for phrase in URGENCY_PHRASES if phrase in combined_text)
+
+    # --- Floor scoring ---
+    floor = 0
+
+    # Suspicious TLD links
+    if suspicious_link_count >= 3:
+        floor = max(floor, 75)
+    elif suspicious_link_count >= 2:
+        floor = max(floor, 68)
+    elif suspicious_link_count >= 1:
+        floor = max(floor, 61)
+
+    # Dangerous file extensions mentioned
+    if dangerous_ext_count >= 3:
+        floor = max(floor, 82)
+    elif dangerous_ext_count >= 2:
+        floor = max(floor, 75)
+    elif dangerous_ext_count >= 1:
+        floor = max(floor, 65)
+
+    # Urgency language
+    if urgency_count >= 2:
+        floor = max(floor, 55)
+    elif urgency_count >= 1:
+        floor = max(floor, 45)
+
+    # Combined attack vectors → CRITICAL
+    if dangerous_ext_count >= 2 and suspicious_link_count >= 1 and urgency_count >= 1:
+        floor = max(floor, 89)
+    elif dangerous_ext_count >= 1 and suspicious_link_count >= 1:
+        floor = max(floor, 76)
+    elif suspicious_link_count >= 1 and urgency_count >= 1:
+        floor = max(floor, 68)
+
+    return floor
+
+
 def extract_json(raw: str) -> dict:
     """Strip markdown fences and extract the first valid JSON object."""
     # Remove ```json ... ``` or ``` ... ```
@@ -183,6 +256,12 @@ threatLevel mapping:
     except (TypeError, ValueError):
         score = 50
     score = max(0, min(100, score))
+
+    # Apply rule-based floor — LLM can never undersell obvious threats
+    floor = rule_based_floor(subject, sender, email.body, email.links, email.attachments)
+    if floor > score:
+        print(f"[Rules] Floor {floor} overrides LLM score {score}")
+        score = floor
 
     # Always derive threatLevel from score — never trust AI's mapping
     threat_level = map_threat_level(score)
