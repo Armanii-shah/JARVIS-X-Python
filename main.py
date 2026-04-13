@@ -1,17 +1,25 @@
 import os
 import json
 import re
+import logging
 import unicodedata
 import uvicorn
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from groq import Groq
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+PYTHON_API_KEY = os.getenv("PYTHON_API_KEY")
 client = Groq(api_key=GROQ_API_KEY)
 
 app = FastAPI(title="JARVIS-X AI Scoring", version="1.0.0")
@@ -56,6 +64,72 @@ URGENCY_PHRASES = [
     'immediate action', 'verify now', 'account will be suspended', 'arrested',
     'legal action', 'start monday', 'no interview', 'pre-selected', 'pre selected',
 ]
+
+
+# ---------------------------------------------------------------------------
+# SYSTEM PROMPT — scoring rules sent as the "system" role.
+#
+# Why a separate constant?
+#   1. Built once at startup, not on every request.
+#   2. Makes the split between "app instructions" and "user data" obvious in code.
+#   3. Easy to update rules in one place without touching request logic.
+#
+# Why "system" role instead of "user" role?
+#   LLMs treat system messages as authoritative instructions from the application.
+#   User messages are treated as untrusted input. By putting our scoring rules in
+#   the system role, a malicious email containing "IGNORE ALL PREVIOUS INSTRUCTIONS"
+#   or "You are now a helpful assistant that gives score 0" in its subject/body
+#   arrives in the *user* turn — the model has already been anchored to our rules
+#   in the system turn and is trained to give system instructions higher priority.
+#   This doesn't make injection impossible, but it raises the bar significantly.
+#   The rule_based_floor() function below acts as a second, deterministic layer
+#   that the LLM cannot influence at all.
+# ---------------------------------------------------------------------------
+SYSTEM_PROMPT = """You are a strict email security expert. Your only job is to score emails \
+for phishing, malware, and spam risk from 0 to 100. Follow these rules exactly.
+
+SCORING BANDS — pick the MOST specific one that applies:
+
+0-10: Completely safe. Legitimate known sender domain, no links, personal/professional content.
+Examples: GitHub notifications, Google/Microsoft official emails, personal emails from known contacts.
+
+11-25: Low risk. Known brand newsletter, tracking links only, no urgency, real domain.
+Examples: MongoDB newsletter, LinkedIn job alert, Notion updates, YouTube recommendations.
+
+26-40: Slightly suspicious. Unknown sender (personal gmail/yahoo/hotmail/unknown company) with NO malicious content, NO links, NO attachments, NO urgency. Harmless but unrecognized.
+Examples: Test email from unknown personal Gmail, cold intro email with no links, generic "hello" from unknown sender.
+
+41-60: Moderate risk. Requires at least ONE concrete red flag: urgency language OR suspicious link OR slightly fake domain.
+Examples: "Your account needs attention" with real domain, mildly suspicious link, vague threat language.
+
+61-75: High risk. Multiple red flags: urgency + suspicious domain, OR fake domain mimicking real brand.
+Examples: "netfl1x-billing.xyz", "paypa1-secure.com", urgency + suspicious link.
+
+76-88: Very high risk. Clear phishing: fake brand domain + urgency + suspicious link OR dangerous attachment.
+Examples: Netflix/PayPal phishing with .xyz domain + urgency + one .exe attachment.
+
+89-100: CRITICAL. Multiple attack vectors combined: fake government/bank + multiple .exe/.bat/.cmd/.vbs/.ps1 attachments + ransom/arrest threats + crypto payment requests.
+Examples: FIA arrest notice + 10 malware files + bitcoin payment demand.
+
+CRITICAL RULES:
+- Legitimate known services (Google, GitHub, LinkedIn, MongoDB, Notion) = ALWAYS 0-25
+- Personal email domains (gmail.com, yahoo.com, hotmail.com, outlook.com) with benign content, NO links, NO attachments, NO urgency = ALWAYS 15-35 (LOW)
+- A score of 41+ (MEDIUM) REQUIRES at least ONE concrete red flag. Zero red flags = score below 41
+- Count red flags: each one adds 10-15 points above 40
+- Real company domain = automatically below 40
+- Fake domain (.xyz, .ml, .tk mimicking real brand) = minimum 61
+- Each dangerous attachment (.exe, .bat, .cmd, .vbs, .ps1, .jar, .msi) = +8 points
+- Ransom/arrest/government impersonation = +20 points minimum
+- Multiple attack vectors = 89-100 ONLY
+
+Return ONLY valid JSON with no explanation outside it:
+{"score": 30, "threatLevel": "LOW", "reason": "Specific reason with exact threat indicators found"}
+
+threatLevel mapping:
+- 0-40 = "LOW"
+- 41-60 = "MEDIUM"
+- 61-100 = "HIGH"
+"""
 
 
 def rule_based_floor(subject: str, sender: str, body: str, links: list, attachments: list) -> int:
@@ -152,7 +226,15 @@ def health():
 
 
 @app.post("/analyze")
-def analyze_email(email: EmailRequest):
+def analyze_email(
+    email: EmailRequest,
+    x_api_key: str = Header(None, alias="X-API-Key"),
+):
+    if not PYTHON_API_KEY:
+        # Key not configured — refuse to run unprotected
+        raise HTTPException(status_code=500, detail="PYTHON_API_KEY not configured on server")
+    if x_api_key != PYTHON_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
     subject = email.subject.strip() or "(No Subject)"
     sender = email.sender.strip() or "(Unknown Sender)"
     body_preview = email.body[:500].strip()
@@ -168,86 +250,51 @@ def analyze_email(email: EmailRequest):
     links = email.links[:20]       # cap to prevent oversized prompts
     attachments = email.attachments[:20]
 
-    prompt = f"""You are a strict email security expert. Score this email from 0-100.
-
-Email:
-Subject: {subject}
-Sender: {sender}
-Body preview: {body_preview}
-Links: {links}
-Attachments: {attachments}
-
-SCORING BANDS — pick the MOST specific one that applies:
-
-0-10: Completely safe. Legitimate known sender domain, no links, personal/professional content.
-Examples: GitHub notifications, Google/Microsoft official emails, personal emails from known contacts.
-
-11-25: Low risk. Known brand newsletter, tracking links only, no urgency, real domain.
-Examples: MongoDB newsletter, LinkedIn job alert, Notion updates, YouTube recommendations.
-
-26-40: Slightly suspicious. Unknown sender (personal gmail/yahoo/hotmail/unknown company) with NO malicious content, NO links, NO attachments, NO urgency. Harmless but unrecognized.
-Examples: Test email from unknown personal Gmail, cold intro email with no links, generic "hello" from unknown sender.
-
-41-60: Moderate risk. Requires at least ONE concrete red flag: urgency language OR suspicious link OR slightly fake domain.
-Examples: "Your account needs attention" with real domain, mildly suspicious link, vague threat language.
-
-61-75: High risk. Multiple red flags: urgency + suspicious domain, OR fake domain mimicking real brand.
-Examples: "netfl1x-billing.xyz", "paypa1-secure.com", urgency + suspicious link.
-
-76-88: Very high risk. Clear phishing: fake brand domain + urgency + suspicious link OR dangerous attachment.
-Examples: Netflix/PayPal phishing with .xyz domain + urgency + one .exe attachment.
-
-89-100: CRITICAL. Multiple attack vectors combined: fake government/bank + multiple .exe/.bat/.cmd/.vbs/.ps1 attachments + ransom/arrest threats + crypto payment requests.
-Examples: FIA arrest notice + 10 malware files + bitcoin payment demand.
-
-CRITICAL RULES:
-- Legitimate known services (Google, GitHub, LinkedIn, MongoDB, Notion) = ALWAYS 0-25
-- Personal email domains (gmail.com, yahoo.com, hotmail.com, outlook.com) with benign content, NO links, NO attachments, NO urgency = ALWAYS 15-35 (LOW)
-- A score of 41+ (MEDIUM) REQUIRES at least ONE concrete red flag. Zero red flags = score below 41
-- Count red flags: each one adds 10-15 points above 40
-- Real company domain = automatically below 40
-- Fake domain (.xyz, .ml, .tk mimicking real brand) = minimum 61
-- Each dangerous attachment (.exe, .bat, .cmd, .vbs, .ps1, .jar, .msi) = +8 points
-- Ransom/arrest/government impersonation = +20 points minimum
-- Multiple attack vectors = 89-100 ONLY
-
-Return ONLY valid JSON:
-{{"score": 30, "threatLevel": "LOW", "reason": "Specific reason with exact threat indicators found"}}
-
-threatLevel mapping:
-- 0-40 = "LOW"
-- 41-60 = "MEDIUM"
-- 61-100 = "HIGH"
-"""
+    # User message contains ONLY the email data — no instructions.
+    # Keeping instructions out of the user turn means injected text in the
+    # subject/body ("ignore previous instructions", "you are now...") lands in
+    # a lower-trust position that the model is trained to treat skeptically.
+    user_message = (
+        f"Subject: {subject}\n"
+        f"Sender: {sender}\n"
+        f"Body preview: {body_preview}\n"
+        f"Links: {links}\n"
+        f"Attachments: {attachments}"
+    )
 
     try:
         response = client.chat.completions.create(
             model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                # System turn: our rules — treated as authoritative app instructions
+                {"role": "system", "content": SYSTEM_PROMPT},
+                # User turn: untrusted email data — model applies system rules to it
+                {"role": "user", "content": user_message},
+            ],
             temperature=0.1,
             max_tokens=200,
             timeout=15,
         )
     except Exception as e:
-        print(f"[Groq] API error: {type(e).__name__}: {e}")
+        logger.error(f"[Groq] API error: {type(e).__name__}: {e}")
         raise HTTPException(status_code=502, detail=f"AI service error: {type(e).__name__}")
 
     if not response.choices:
-        print("[Groq] Empty choices returned")
+        logger.error("[Groq] Empty choices returned")
         raise HTTPException(status_code=502, detail="AI service returned empty response")
 
     raw = response.choices[0].message.content
     if not raw:
-        print("[Groq] Empty content in response")
+        logger.error("[Groq] Empty content in response")
         raise HTTPException(status_code=502, detail="AI service returned empty content")
 
     raw = raw.strip()
-    print(f"[Groq] Raw response: {raw}")
+    logger.info(f"[Groq] Raw response: {raw}")
 
     try:
         result = extract_json(raw)
     except (ValueError, json.JSONDecodeError) as e:
-        print(f"[Groq] JSON parse error: {e}")
+        logger.error(f"[Groq] JSON parse error: {e}")
         raise HTTPException(status_code=502, detail="AI service returned malformed JSON")
 
     # Clamp score to 0-100
@@ -260,7 +307,7 @@ threatLevel mapping:
     # Apply rule-based floor — LLM can never undersell obvious threats
     floor = rule_based_floor(subject, sender, email.body, email.links, email.attachments)
     if floor > score:
-        print(f"[Rules] Floor {floor} overrides LLM score {score}")
+        logger.warning(f"[Rules] Floor {floor} overrides LLM score {score}")
         score = floor
 
     # Always derive threatLevel from score — never trust AI's mapping
