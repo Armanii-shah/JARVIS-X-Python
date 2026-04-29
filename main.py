@@ -2,7 +2,6 @@ import os
 import json
 import re
 import logging
-import unicodedata
 import uvicorn
 from dotenv import load_dotenv
 load_dotenv()
@@ -58,11 +57,19 @@ def map_threat_level(score: int) -> str:
 
 
 DANGEROUS_EXTENSIONS = {'.exe', '.bat', '.cmd', '.vbs', '.ps1', '.jar', '.msi', '.scr', '.pif'}
-SUSPICIOUS_TLDS = {'.xyz', '.ml', '.tk', '.pw', '.cf', '.ga', '.gq', '.icu', '.top', '.click', '.download'}
+SUSPICIOUS_TLDS = {
+    '.xyz', '.ml', '.tk', '.pw', '.cf', '.ga', '.gq', '.icu', '.top',
+    '.click', '.download', '.ru', '.cc', '.biz', '.info', '.live',
+    '.online', '.site', '.win', '.loan', '.work', '.party', '.racing',
+}
 URGENCY_PHRASES = [
     'expires in', 'act now', 'within 24 hours', 'offer expires', '24 hours',
     'immediate action', 'verify now', 'account will be suspended', 'arrested',
     'legal action', 'start monday', 'no interview', 'pre-selected', 'pre selected',
+    'urgent', 'click now', 'pay now', 'pay immediately', 'verify your account',
+    'account suspended', 'limited time', 'winner', 'congratulations you',
+    'you have been selected', 'claim your', 'confirm your', 'unusual activity',
+    'suspicious activity', 'your account has been', 'hacked', 'compromised',
 ]
 
 
@@ -207,10 +214,11 @@ def extract_json(raw: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # Extract first {...} block as fallback
-    match = re.search(r"\{[^{}]+\}", raw, re.DOTALL)
-    if match:
-        return json.loads(match.group())
+    # Extract outermost {...} block as fallback — handles nested JSON correctly
+    start = raw.find('{')
+    end = raw.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        return json.loads(raw[start:end + 1])
 
     raise ValueError(f"No valid JSON found in response: {raw[:200]}")
 
@@ -266,9 +274,7 @@ def analyze_email(
         response = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[
-                # System turn: our rules — treated as authoritative app instructions
                 {"role": "system", "content": SYSTEM_PROMPT},
-                # User turn: untrusted email data — model applies system rules to it
                 {"role": "user", "content": user_message},
             ],
             temperature=0.1,
@@ -277,7 +283,21 @@ def analyze_email(
         )
     except Exception as e:
         logger.error(f"[Groq] API error: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=502, detail=f"AI service error: {type(e).__name__}")
+        logger.warning("[Groq] Falling back to rule-based scoring only")
+
+        floor = rule_based_floor(subject, sender, email.body, email.links, email.attachments)
+        # Default to 42 (MEDIUM) when AI is unavailable and no rule signals fire.
+        # This ensures unknown/unrecognized emails still trigger an alert rather
+        # than silently passing as safe when we can't verify them with AI.
+        fallback_score = max(floor, 42)
+        fallback_score = max(0, min(100, fallback_score))
+        threat_level = map_threat_level(fallback_score)
+        logger.info(f"[Fallback] score={fallback_score} threatLevel={threat_level}")
+        return {
+            "score": fallback_score,
+            "threatLevel": threat_level,
+            "reason": f"Rule-based analysis (AI unavailable: {type(e).__name__}). Scored as MEDIUM by default when AI is unreachable — verify manually.",
+        }
 
     if not response.choices:
         logger.error("[Groq] Empty choices returned")
